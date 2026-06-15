@@ -1,218 +1,123 @@
-import csv
-import json
-import math
-import os
-import re
-import requests
-import time
+import csv, math, os, re, requests, time
 from bs4 import BeautifulSoup
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from kiwipiepy import Kiwi
+import urllib3
+
+# 네이버 뉴스 리다이렉트(n.news.naver.com) 시 발생하는 SSL 경고까지 완벽히 차단
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import logging
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 LIMIT_COUNT = 100
-CLIENT_ID = "iz0XBoN0gbwosRbh5GSB"
-CLIENT_SECRET = "1CR6msoO53"
-KEYWORD = "공항 AND 친환경"
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-STOPWORDS = {
-    "이", "그", "저", "것", "수", "등", "들", "더", "가", "와", "과",
-    "에서", "에게", "를", "은", "는", "도", "로", "으로", "하다", "합니다",
-    "이다", "되다", "있다", "없다", "이번", "여기", "오늘", "내일", "지난",
-    "대한", "관련", "뉴스", "기자", "단계", "공항", "친환경"
-}
+CLIENT_ID, CLIENT_SECRET = "iz0XBoN0gbwosRbh5GSB", "1CR6msoO53"
+KEYWORD = "공항 친환경"
+DATA_DIR, OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data"), os.path.join(os.path.dirname(__file__), "output")
+STOPWORDS = {"이", "그", "저", "것", "수", "등", "들", "더", "가", "와", "과", "에서", "에게", "를", "은", "는", "도", "로", "으로", "하다", "합니다", "이다", "되다", "있다", "없다", "이번", "여기", "오늘", "내일", "지난", "대한", "관련", "뉴스", "기자", "단계", "공항", "친환경", "위하", "까지", "브리핑", "이슈", "올해"}
 
 session = requests.Session()
-session.headers.update({
-    "X-Naver-Client-Id": CLIENT_ID,
-    "X-Naver-Client-Secret": CLIENT_SECRET,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0"
-})
-
+session.verify = False
+session.headers.update({"X-Naver-Client-Id": CLIENT_ID, "X-Naver-Client-Secret": CLIENT_SECRET, "User-Agent": "Mozilla/5.0"})
 kiwi = Kiwi()
 
 def tokenize_ko(text):
-    tokens = []
-    for token in kiwi.tokenize(text):
-        if not token.tag:
-            continue
-        if token.tag[0] not in ("N", "V", "J", "X"):
-            continue
-        form = token.form.strip()
-        if len(form) > 1 and form not in STOPWORDS:
-            tokens.append(form)
-    return tokens
-
+    return [t.form.strip() for t in kiwi.tokenize(text) if t.tag and t.tag[0] in ("N", "V", "J", "X") and len(t.form.strip()) > 1 and t.form.strip() not in STOPWORDS]
 
 def compute_tfidf(documents):
     token_docs = [tokenize_ko(doc) for doc in documents]
     df = Counter()
-    for tokens in token_docs:
-        df.update(set(tokens))
-
-    n_docs = len(token_docs)
+    for tokens in token_docs: df.update(set(tokens))
+    
     corpus_scores = []
     for tokens in token_docs:
         tf = Counter(tokens)
         total = sum(tf.values()) or 1
-        scores = {}
-        for term, count in tf.items():
-            tf_val = count / total
-            idf_val = math.log((n_docs + 1) / (df[term] + 1)) + 1
-            scores[term] = tf_val * idf_val
+        scores = {term: (count / total) * (math.log((len(token_docs) + 1) / (df[term] + 1)) + 1) for term, count in tf.items()}
         corpus_scores.append(scores)
     return corpus_scores, df
 
-
-def get_top_terms(tfidf_scores, top_n=10):
-    return sorted(tfidf_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
-
-
-def analyze_tfidf(documents, titles=None, top_n_terms=50):
-    if not documents:
-        print("TF-IDF 분석할 문서가 없습니다.")
-        return
-
+def analyze_tfidf(documents, titles):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    titles = titles or [f"문서 {i + 1}" for i in range(len(documents))]
     tfidf_corpora, df = compute_tfidf(documents)
+    
     overall = Counter()
-    for scores in tfidf_corpora:
-        overall.update(scores)
+    for scores in tfidf_corpora: overall.update(scores)
 
-    summary_path = os.path.join(OUTPUT_DIR, "tfidf_summary.csv")
-    with open(summary_path, "w", encoding="utf-8", newline="") as csvfile:
-        writer = csv.writer(csvfile)
+    with open(os.path.join(OUTPUT_DIR, "tfidf_summary.csv"), "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
         writer.writerow(["rank", "term", "score", "document_frequency"])
-        for rank, (term, score) in enumerate(overall.most_common(top_n_terms), 1):
-            writer.writerow([rank, term, f"{score:.6f}", df[term]])
+        for r, (term, score) in enumerate(overall.most_common(50), 1): writer.writerow([r, term, f"{score:.6f}", df[term]])
 
-    detailed_path = os.path.join(OUTPUT_DIR, "tfidf_document_top_terms.csv")
-    with open(detailed_path, "w", encoding="utf-8", newline="") as csvfile:
-        writer = csv.writer(csvfile)
+    with open(os.path.join(OUTPUT_DIR, "tfidf_document_top_terms.csv"), "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
         writer.writerow(["document_index", "title", "term", "score"])
         for idx, (title, scores) in enumerate(zip(titles, tfidf_corpora), 1):
-            for term, score in get_top_terms(scores, 20):
+            for term, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:20]:
                 writer.writerow([idx, title, term, f"{score:.6f}"])
 
-    print(f"TF-IDF 분석 완료: {summary_path}")
-    print(f"문서별 상위 단어 저장 완료: {detailed_path}")
-
-
-def handle_exception(default_return):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            try: return func(*args, **kwargs)
-            except Exception as e:
-                print(f" [{func.__name__}] 오류 발생: {e}")
-                return default_return
-        return wrapper
-    return decorator
-
-@handle_exception(default_return=[])
-def get_naver_news(search_keyword, total_count=1000):
-    """페이징을 사용하여 total_count 만큼 뉴스 리스트를 가져옵니다."""
-    url = "https://openapi.naver.com/v1/search/news.json"
-    results = []
+def get_naver_news(keyword, total_count):
+    url, results = "https://openapi.naver.com/v1/search/news.json", []
     
-    # 100개씩 루프를 돌며 수집
-    for start in range(1, total_count + 1, 100):
-        params = {"query": search_keyword, "display": 100, "start": start, "sort": "sim"}
-        response = session.get(url, params=params)
-        
-        if response.status_code == 200:
-            items = response.json().get('items', [])
-            if not items: break
-            results.extend(items)
-            print(f"    ▶ 뉴스 리스트 수집 중... (현재 {len(results)}개 확보)")
-            time.sleep(0.1) # 서버 부하 방지
-        else:
-            print(f"    ▶ API 호출 오류: {response.status_code}")
-            break
+    for sort_type in ["sim", "date"]:
+        start = 1
+        while len(results) < total_count and start <= 1000:
+            try:
+                res = session.get(url, params={"query": keyword, "display": 100, "start": start, "sort": sort_type})
+                items = res.json().get('items', []) if res.status_code == 200 else []
+                if not items: break
+                
+                for item in items:
+                    if "news.naver.com" in item.get('link', '') and item['link'] not in [r['link'] for r in results]:
+                        results.append(item)
+                        if len(results) >= total_count: return results
+                start += 100
+                time.sleep(0.1)
+            except: break
     return results
 
-@handle_exception(default_return="[본문 추출 실패]")
 def extract_article_text(url):
-    """BeautifulSoup 기반으로 HTML에서 본문 텍스트를 추출합니다."""
-    response = session.get(url, timeout=5)
-    response.encoding = response.apparent_encoding if response.apparent_encoding else 'utf-8'
-
-    if response.status_code != 200:
-        return f"[본문 추출 실패: HTTP {response.status_code}]"
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # 불필요한 스크립트/스타일 제거
-    for tag in soup(["script", "style", "noscript", "iframe"]):
-        tag.decompose()
-
-    article = soup.find("article")
-    if article:
-        paragraphs = article.find_all("p")
-    else:
-        candidates = soup.find_all("div", class_=re.compile(r"(article|content|news|text|body)", re.I))
-        if candidates:
-            paragraphs = []
-            for candidate in candidates:
-                paragraphs.extend(candidate.find_all("p"))
-        else:
-            paragraphs = soup.find_all("p")
-
-    paragraph_texts = [p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)]
-    if paragraph_texts:
-        return "\n\n".join(paragraph_texts)
-
-    return soup.get_text(separator="\n", strip=True)
-
-def clean_text(text, is_filename=False):
-    if is_filename:
-        return re.sub(r'[\/:*?"<>|]', '_', text).strip()
-    return re.sub(r'<[^>]*>|&quot;|&amp;', lambda m: {'&quot;': '"', '&amp;': '&'}.get(m.group(), ''), text)
+    try:
+        res = session.get(url, timeout=5)
+        soup = BeautifulSoup(res.text, "html.parser")
+        article = soup.find("article", id="dic_area") or soup.find("div", id="newsct_article") or soup.find("div", id="articleBodyContents")
+        if article:
+            for tag in article(["script", "style", "noscript", "iframe", "span"]): tag.decompose()
+            text = re.sub(r'\[.*?\]', '', article.get_text(separator="\n", strip=True))
+            if text.strip(): return text.strip()
+    except: pass
+    return None
 
 def process_single_news(args):
-    idx, item, total = args
-    title = clean_text(item['title'])
-    link = item['link']
-    content = extract_article_text(link)
+    idx, item = args
+    title = re.sub(r'<[^>]*>|&quot;|&amp;', lambda m: {'&quot;': '"', '&amp;': '&'}.get(m.group(), ''), item['title'])
+    content = extract_article_text(item['link'])
+    if not content: return None
     
-    file_content = f"제목: {title}\n링크: {link}\n{'-'*50}\n본문:\n{content}\n"
-    filename = f"{idx:04d}_{clean_text(title, is_filename=True)[:30]}.txt"
-    filepath = os.path.join(DATA_DIR, filename)
+    # [버그 수정] 윈도우 파일명 금지 문자(\ / : * ? " < > |)를 모두 언더바(_)로 안전하게 변경
+    safe_title = re.sub(r'[\/:*?"<>|]', '_', title).strip()[:30]
+    filename = f"{idx:04d}_{safe_title}.txt"
     
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(file_content)
-    print(f"    저장 완료: {filepath}")
-    return {
-        'idx': idx,
-        'title': title,
-        'content': content,
-        'filepath': filepath,
-    }
+    with open(os.path.join(DATA_DIR, filename), 'w', encoding='utf-8') as f:
+        f.write(f"제목: {title}\n링크: {item['link']}\n{'-'*50}\n본문:\n{content}\n")
+    print(f"    [{idx:03d}] 저장 완료")
+    return {'title': title, 'content': content}
 
 if __name__ == "__main__":
-    print(f"검색어: {KEYWORD}")
-    print(f"관련 뉴스 {LIMIT_COUNT}개 수집 시작...\n")
+    print(f"검색어: {KEYWORD} | 목표: {LIMIT_COUNT}개")
+    news_items = get_naver_news(KEYWORD, LIMIT_COUNT)
     
-    # 1. 뉴스 리스트 먼저 확보
-    news_items = get_naver_news(KEYWORD, total_count=LIMIT_COUNT)
-    total_count = len(news_items)
-    print(f"\n총 {total_count}개의 뉴스 본문 추출 및 저장을 시작합니다.\n")
+    if not news_items:
+        print("수집된 링크가 없습니다.")
+        exit()
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    
-    # 2. 병렬로 본문 처리
-    tasks = [(idx, item, total_count) for idx, item in enumerate(news_items, 1)]
     with ThreadPoolExecutor(max_workers=8) as executor:
-        saved_results = list(executor.map(process_single_news, tasks))
+        saved_results = list(executor.map(process_single_news, enumerate(news_items, 1)))
 
-    # 3. 추출된 본문을 기반으로 TF-IDF 분석
-    valid_results = [item for item in saved_results if item and item['content'] and not item['content'].startswith('[본문 추출 실패]')]
-    contents = [item['content'] for item in valid_results]
-    titles = [item['title'] for item in valid_results]
-    if contents:
-        analyze_tfidf(contents, titles, top_n_terms=15)
-    else:
-        print("TF-IDF 분석을 위한 본문 데이터가 충분하지 않습니다.")
-        
+    valid_results = [r for r in saved_results if r]
+    print(f"\n▶ 본문 추출 성공 문서: {len(valid_results)} / {len(news_items)}")
+    
+    if valid_results:
+        analyze_tfidf([r['content'] for r in valid_results], [r['title'] for r in valid_results])
     print("\n완료!")
